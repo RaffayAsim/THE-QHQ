@@ -1,0 +1,689 @@
+﻿diff --git "a/Working Plugin\\events-api (1).php" "b/Last WP Plugin\\events-api\\events-api.php"
+index 871304e..45a86da 100644
+--- "a/Working Plugin\\events-api (1).php"	
++++ "b/Last WP Plugin\\events-api\\events-api.php"	
+@@ -4,11 +4,38 @@
+  * Plugin Name: Events + Booking API
+  * Description: Registers Events & Event Booking CPTs and exposes REST APIs: GET /app/v1/events and POST /app/v1/event-booking
+  * Version: 1.0
+- * Author: Generated for Shoaib
++ * Author: QauntumArc
+  */
+ 
+ if (!defined('ABSPATH')) exit;
+ 
++// Helper function to dynamically locate and load the Firebase JWT library
++function eapi_load_jwt_library()
++{
++    if (class_exists('\Firebase\JWT\JWT')) {
++        return true;
++    }
++
++    $locations = [];
++    if (defined('WP_PLUGIN_DIR')) {
++        $locations[] = WP_PLUGIN_DIR . '/headless-user-register/jwt/';
++    }
++    $locations[] = dirname(__DIR__) . '/headless-user-register/jwt/';
++
++    foreach ($locations as $loc) {
++        if (file_exists($loc . 'JWT.php') && file_exists($loc . 'Key.php')) {
++            require_once $loc . 'JWT.php';
++            require_once $loc . 'Key.php';
++            return true;
++        }
++    }
++
++    return false;
++}
++
++// Load Firebase JWT library if not already loaded by headless-user-register
++eapi_load_jwt_library();
++
+ /* ---------------------------
+  * Register Custom Post Types
+  * ---------------------------
+@@ -117,17 +144,70 @@ function eapi_extract_auth_token(WP_REST_Request $request): string
+ 
+ function eapi_decode_auth_email(WP_REST_Request $request)
+ {
+-    $token = eapi_extract_auth_token($request);
+-    if ($token === '') {
++    $token = '';
++    if (function_exists('app_get_auth_token')) {
++        $token = app_get_auth_token($request);
++    }
++    if (empty($token)) {
++        $token = $request->get_header('authorization');
++        if (!$token) {
++            $token = trim((string) $request->get_param('token'));
++            if ($token === '' && isset($_SERVER['HTTP_AUTHORIZATION'])) {
++                $token = trim($_SERVER['HTTP_AUTHORIZATION']);
++            }
++            if ($token === '' && isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
++                $token = trim($_SERVER['REDIRECT_HTTP_AUTHORIZATION']);
++            }
++        }
++    }
++
++    if (empty($token)) {
+         return new WP_Error('no_token', 'Authorization token required.', ['status' => 401]);
+     }
+ 
+-    $decoded = json_decode(base64_decode($token), true);
+-    if (empty($decoded['email']) || time() > intval($decoded['exp'])) {
++    // Strip "Bearer " prefix case-insensitively if present
++    if (stripos($token, 'Bearer ') === 0) {
++        $token = substr($token, 7);
++    }
++    $token = trim($token);
++
++    $secret = defined('SECURE_JWT_SECRET') ? SECURE_JWT_SECRET : LOGGED_IN_SALT;
++    $email = '';
++    $exp = 0;
++    $is_jwt = (substr_count($token, '.') === 2);
++
++    if ($is_jwt) {
++        eapi_load_jwt_library();
++
++        if (class_exists('\Firebase\JWT\JWT')) {
++            try {
++                if (class_exists('\Firebase\JWT\Key')) {
++                    $decoded_obj = \Firebase\JWT\JWT::decode($token, new \Firebase\JWT\Key($secret, 'HS256'));
++                } else {
++                    $decoded_obj = \Firebase\JWT\JWT::decode($token, $secret, array('HS256'));
++                }
++                $decoded = (array) $decoded_obj;
++                $email = $decoded['email'] ?? '';
++                $exp = intval($decoded['exp'] ?? 0);
++            } catch (\Exception $e) {
++                return new WP_Error('invalid_token', 'Token signature verification failed or expired: ' . $e->getMessage(), ['status' => 401]);
++            }
++        } else {
++            return new WP_Error('jwt_not_loaded', 'JWT library not loaded.', ['status' => 500]);
++        }
++    } else {
++        $decoded = json_decode(base64_decode($token), true);
++        if (is_array($decoded)) {
++            $email = $decoded['email'] ?? '';
++            $exp = intval($decoded['exp'] ?? 0);
++        }
++    }
++
++    if (empty($email) || time() > $exp) {
+         return new WP_Error('invalid_token', 'Session expired or invalid.', ['status' => 401]);
+     }
+ 
+-    return sanitize_email($decoded['email']);
++    return sanitize_email($email);
+ }
+ 
+ function app_handle_invite_response(WP_REST_Request $request)
+@@ -233,6 +313,124 @@ function app_handle_invite_response(WP_REST_Request $request)
+         return new WP_Error('db_error', 'Failed to update invitation.', ['status' => 500]);
+     }
+ 
++    if ($action === 'reject' && $pair_code !== '') {
++        /* ΓöÇΓöÇ Rejection Cascade ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */
++
++        // 1. Update the primary user's row (the person who initiated the booking)
++        $wpdb->query(
++            $wpdb->prepare(
++                "UPDATE {$table} SET user_status = 'Request Rejected', status = 'cancel' WHERE pair_code = %s AND isGuestEntry = 0",
++                $pair_code
++            )
++        );
++
++        // 2. Cancel all other pending guest rows (not the one who just rejected)
++        $wpdb->query(
++            $wpdb->prepare(
++                "UPDATE {$table} SET user_status = 'Cancel', status = 'cancel' WHERE pair_code = %s AND id <> %d AND isGuestEntry = 1 AND LOWER(user_status) = 'waiting approval'",
++                $pair_code,
++                $booking_id
++            )
++        );
++
++        // 3. Transition the WP booking post to 'booking_rejected'
++        $booking_post_id = eapi_find_booking_post_id_by_qr_id($qr_id);
++        if ($booking_post_id > 0) {
++            wp_update_post(['ID' => $booking_post_id, 'post_status' => 'booking_rejected']);
++        }
++
++        // 4. Send rejection notification emails
++        $rejector_name = sanitize_text_field($booking['username'] ?? $user_email);
++
++        // Notify the primary user (inviter)
++        $primary = $wpdb->get_row(
++            $wpdb->prepare("SELECT email, username FROM {$table} WHERE pair_code = %s AND isGuestEntry = 0 LIMIT 1", $pair_code),
++            ARRAY_A
++        );
++        $primary_email = sanitize_email($primary['email'] ?? '');
++        if ($primary_email && is_email($primary_email)) {
++            $dashboard_url = eapi_get_booking_dashboard_url();
++            $body = eapi_build_booking_email_shell([
++                'recipient_name'  => esc_html($primary['username'] ?? 'Member'),
++                'headline'        => 'Booking invitation declined',
++                'event_name'      => esc_html($event_name),
++                'hero_image_url'  => eapi_get_event_image_url($event_id),
++                'badge_text'      => 'DECLINED',
++                'header_gradient' => 'linear-gradient(135deg,#7f1d1d 0%,#dc2626 50%,#7f1d1d 100%)',
++                'accent_gradient' => 'linear-gradient(90deg,#dc2626,#f87171,#dc2626)',
++                'intro_lines'     => [
++                    esc_html($rejector_name) . ' has declined the booking invitation for ' . esc_html($event_name) . '.',
++                    'The booking request has been cancelled for all participants.',
++                ],
++                'note_lines'      => [
++                    'You can create a new booking request with a different partner if you wish.',
++                ],
++                'detail_rows'     => [
++                    ['label' => 'Event',       'value' => esc_html($event_name)],
++                    ['label' => 'Declined By', 'value' => esc_html($rejector_name)],
++                    ['label' => 'Status',      'value' => 'Cancelled', 'highlight' => true],
++                ],
++                'cta_label' => 'View My Bookings',
++                'cta_url'   => $dashboard_url,
++            ]);
++            eapi_dispatch_booking_email([
++                'to'             => $primary_email,
++                'subject'        => 'Booking Invitation Declined ΓÇö ' . $event_name,
++                'message'        => $body,
++                'event_id'       => $event_id,
++                'event_name'     => esc_html($event_name),
++                'booking_row_id' => 0,
++                'email_type'     => 'invite_rejected',
++                'meta'           => ['rejected_by' => $rejector_name],
++            ]);
++        }
++
++        // Notify other guests who were still waiting
++        $other_guests = $wpdb->get_results(
++            $wpdb->prepare(
++                "SELECT email, username FROM {$table} WHERE pair_code = %s AND id <> %d AND isGuestEntry = 1 AND LOWER(user_status) = 'cancel'",
++                $pair_code,
++                $booking_id
++            ),
++            ARRAY_A
++        ) ?: [];
++        foreach ($other_guests as $other) {
++            $other_email = sanitize_email($other['email'] ?? '');
++            if ($other_email && is_email($other_email)) {
++                $other_body = eapi_build_booking_email_shell([
++                    'recipient_name'  => esc_html($other['username'] ?? 'Member'),
++                    'headline'        => 'Booking cancelled',
++                    'event_name'      => esc_html($event_name),
++                    'hero_image_url'  => eapi_get_event_image_url($event_id),
++                    'badge_text'      => 'CANCELLED',
++                    'header_gradient' => 'linear-gradient(135deg,#7f1d1d 0%,#dc2626 50%,#7f1d1d 100%)',
++                    'accent_gradient' => 'linear-gradient(90deg,#dc2626,#f87171,#dc2626)',
++                    'intro_lines'     => [
++                        'The booking for ' . esc_html($event_name) . ' has been cancelled because ' . esc_html($rejector_name) . ' declined the invitation.',
++                    ],
++                    'note_lines'      => [],
++                    'detail_rows'     => [
++                        ['label' => 'Event',       'value' => esc_html($event_name)],
++                        ['label' => 'Declined By', 'value' => esc_html($rejector_name)],
++                        ['label' => 'Status',      'value' => 'Cancelled', 'highlight' => true],
++                    ],
++                    'cta_label' => 'View My Bookings',
++                    'cta_url'   => eapi_get_booking_dashboard_url(),
++                ]);
++                eapi_dispatch_booking_email([
++                    'to'             => $other_email,
++                    'subject'        => 'Booking Cancelled ΓÇö ' . $event_name,
++                    'message'        => $other_body,
++                    'event_id'       => $event_id,
++                    'event_name'     => esc_html($event_name),
++                    'booking_row_id' => 0,
++                    'email_type'     => 'invite_cancelled',
++                    'meta'           => ['rejected_by' => $rejector_name],
++                ]);
++            }
++        }
++    }
++
+     if ($action === 'accept' && $pair_code !== '') {
+         $guest_total = (int) $wpdb->get_var(
+             $wpdb->prepare("SELECT COUNT(*) FROM {$table} WHERE pair_code = %s AND isGuestEntry = 1", $pair_code)
+@@ -263,7 +461,7 @@ function app_handle_invite_response(WP_REST_Request $request)
+ 
+     return [
+         'success' => true,
+-        'message' => $action === 'accept' ? 'Invitation accepted.' : 'Invitation rejected.',
++        'message' => $action === 'accept' ? 'Invitation accepted.' : 'Invitation rejected. All participants have been notified.',
+         'new_status' => $target_user_status,
+     ];
+ }
+@@ -300,12 +498,13 @@ function eapi_record_booking_rejection(int $booking_post_id): void
+     $qr_id  = sanitize_text_field((string) (get_post_meta($booking_post_id, 'booking_qr_id', true) ?? ''));
+     if (!$qr_id) return;
+ 
+-    $wpdb->update(
+-        $table,
+-        ['user_status' => 'Rejected', 'status' => 'cancel'],
+-        ['qr_id' => $qr_id],
+-        ['%s', '%s'],
+-        ['%s']
++    // Skip rows already set by the rejection cascade (preserves who specifically rejected)
++    $wpdb->query(
++        $wpdb->prepare(
++            "UPDATE {$table} SET user_status = 'Rejected', status = 'cancel'
++             WHERE qr_id = %s AND user_status NOT IN ('Request Rejected', 'Cancel')",
++            $qr_id
++        )
+     );
+ }
+ 
+@@ -664,9 +863,9 @@ HTML;
+ 
+ function eapi_send_couple_invitation_email(array $couple, string $event_name, string $inviter, array $context = [])
+ {
+-    if (!eapi_should_send_secondary_attendee_emails()) {
+-        return;
+-    }
++    // Note: Invitation emails are critical approval requests and must always be sent.
++    // The eapi_should_send_secondary_attendee_emails() guard is intentionally NOT applied
++    // here ΓÇö it is designed for duplicate ticket confirmation emails, not invitations.
+ 
+         $email = sanitize_email($couple['email'] ?? '');
+         if (!$email) {
+@@ -1065,8 +1264,9 @@ function eapi_normalize_additional_persons($raw): array
+         $phone = sanitize_text_field($item['phone'] ?? '');
+         $nic = sanitize_text_field($item['nic'] ?? $item['cnic'] ?? '');
+         $gender = eapi_sanitize_tier_gender($item['gender'] ?? '');
++        $user_id = intval($item['user_id'] ?? $item['id'] ?? 0);
+ 
+-        if ($name === '' && $email === '' && $phone === '' && $nic === '') {
++        if ($name === '' && $email === '' && $phone === '' && $nic === '' && $user_id === 0) {
+             continue;
+         }
+ 
+@@ -1076,6 +1276,7 @@ function eapi_normalize_additional_persons($raw): array
+             'phone' => $phone,
+             'nic' => $nic,
+             'gender' => $gender,
++            'user_id' => $user_id,
+         ];
+     }
+ 
+@@ -1089,22 +1290,15 @@ function app_event_booking(WP_REST_Request $request)
+     global $wpdb;
+ 
+     /* 1∩╕ÅΓâú Authorization Check */
+-    $auth_header = eapi_extract_auth_token($request);
+-    if (!$auth_header) {
+-        return new WP_Error('no_token', 'Authorization token required.', ['status' => 401]);
+-    }
+-
+-    $decoded = json_decode(base64_decode($auth_header), true);
+-    if (empty($decoded['email']) || time() > intval($decoded['exp'])) {
+-        return new WP_Error('invalid_token', 'Session expired or invalid.', ['status' => 401]);
++    $user_email = eapi_decode_auth_email($request);
++    if (is_wp_error($user_email)) {
++        return $user_email;
+     }
+ 
+-                        $payment_note,
+-    $user = get_user_by('email', sanitize_email($decoded['email']));
++    $user = get_user_by('email', $user_email);
+     if (!$user) {
+         return new WP_Error('user_not_found', 'User not found.', ['status' => 404]);
+     }
+-                        ['label' => 'Payment', 'value' => $payment_label],
+ 
+     /* 2∩╕ÅΓâú Required Params */
+     $params = $request->get_json_params();
+@@ -1136,26 +1330,80 @@ function app_event_booking(WP_REST_Request $request)
+ 
+     $couple = null;
+     if (is_array($raw_couple)) {
++        $partner_user_id = intval($raw_couple['user_id'] ?? $raw_couple['id'] ?? 0);
++        $partner_email = sanitize_email($raw_couple['email'] ?? '');
++        
++        $fallback_user = null;
++        if ($partner_user_id > 0) {
++            $fallback_user = get_user_by('id', $partner_user_id);
++        } elseif ($partner_email !== '') {
++            $fallback_user = get_user_by('email', $partner_email);
++        }
++        
++        $fallback_name = '';
++        $fallback_phone = '';
++        $fallback_nic = '';
++        $fallback_car = '';
++        $fallback_gender = '';
++        if ($fallback_user) {
++            $fallback_name = $fallback_user->display_name ?: $fallback_user->user_login;
++            $fallback_email = $fallback_user->user_email;
++            if ($partner_email === '') $partner_email = $fallback_email;
++            
++            $fallback_phone = get_user_meta($fallback_user->ID, 'phone', true);
++            $fallback_nic = get_user_meta($fallback_user->ID, 'cnic', true);
++            $fallback_car = get_user_meta($fallback_user->ID, 'car_number', true);
++            $fallback_gender = get_user_meta($fallback_user->ID, 'gender', true);
++        }
++
+         $couple = [
+-            'name'      => sanitize_text_field($raw_couple['name'] ?? ''),
+-            'email'     => sanitize_email($raw_couple['email'] ?? ''),
+-            'phone'     => sanitize_text_field($raw_couple['phone'] ?? ''),
+-            'nic'       => sanitize_text_field($raw_couple['nic'] ?? ''),
+-            'carNumber' => sanitize_text_field($raw_couple['carNumber'] ?? ''),
+-            'gender'    => eapi_sanitize_tier_gender($raw_couple['gender'] ?? ''),
++            'name'      => sanitize_text_field($raw_couple['name'] ?? '') ?: $fallback_name,
++            'email'     => $partner_email,
++            'phone'     => sanitize_text_field($raw_couple['phone'] ?? '') ?: $fallback_phone,
++            'nic'       => sanitize_text_field($raw_couple['nic'] ?? '') ?: $fallback_nic,
++            'carNumber' => sanitize_text_field($raw_couple['carNumber'] ?? '') ?: $fallback_car,
++            'gender'    => eapi_sanitize_tier_gender($raw_couple['gender'] ?? '') ?: eapi_sanitize_tier_gender($fallback_gender),
+             'payment_status' => eapi_sanitize_partner_payment_status($raw_couple['payment_status'] ?? ($params['partner_payment_status'] ?? '')),
++            'user_id'   => $fallback_user ? $fallback_user->ID : 0,
+         ];
+     }
+ 
+     if (!$couple && !empty($couple_vals)) {
++        $partner_user_id = intval($couple_vals['user_id'] ?? $couple_vals['id'] ?? 0);
++        $partner_email = sanitize_email(eapi_pick_first_value($couple_vals, ['email'], 'email'));
++        
++        $fallback_user = null;
++        if ($partner_user_id > 0) {
++            $fallback_user = get_user_by('id', $partner_user_id);
++        } elseif ($partner_email !== '') {
++            $fallback_user = get_user_by('email', $partner_email);
++        }
++        
++        $fallback_name = '';
++        $fallback_phone = '';
++        $fallback_nic = '';
++        $fallback_car = '';
++        $fallback_gender = '';
++        if ($fallback_user) {
++            $fallback_name = $fallback_user->display_name ?: $fallback_user->user_login;
++            $fallback_email = $fallback_user->user_email;
++            if ($partner_email === '') $partner_email = $fallback_email;
++            
++            $fallback_phone = get_user_meta($fallback_user->ID, 'phone', true);
++            $fallback_nic = get_user_meta($fallback_user->ID, 'cnic', true);
++            $fallback_car = get_user_meta($fallback_user->ID, 'car_number', true);
++            $fallback_gender = get_user_meta($fallback_user->ID, 'gender', true);
++        }
++
+         $couple = [
+-            'name'      => eapi_pick_first_value($couple_vals, ['name', 'full_name']),
+-            'email'     => eapi_pick_first_value($couple_vals, ['email'], 'email'),
+-            'phone'     => eapi_pick_first_value($couple_vals, ['phone', 'phone_number']),
+-            'nic'       => eapi_pick_first_value($couple_vals, ['nic', 'cnic']),
+-            'carNumber' => eapi_pick_first_value($couple_vals, ['carNumber', 'car_number']),
+-            'gender'    => eapi_sanitize_tier_gender($couple_vals['gender'] ?? ''),
++            'name'      => sanitize_text_field(eapi_pick_first_value($couple_vals, ['name', 'full_name'])) ?: $fallback_name,
++            'email'     => $partner_email,
++            'phone'     => sanitize_text_field(eapi_pick_first_value($couple_vals, ['phone', 'phone_number'])) ?: $fallback_phone,
++            'nic'       => sanitize_text_field(eapi_pick_first_value($couple_vals, ['nic', 'cnic'])) ?: $fallback_nic,
++            'carNumber' => sanitize_text_field(eapi_pick_first_value($couple_vals, ['carNumber', 'car_number'])) ?: $fallback_car,
++            'gender'    => eapi_sanitize_tier_gender($couple_vals['gender'] ?? '') ?: eapi_sanitize_tier_gender($fallback_gender),
+             'payment_status' => eapi_sanitize_partner_payment_status($couple_vals['payment_status'] ?? ($params['partner_payment_status'] ?? '')),
++            'user_id'   => $fallback_user ? $fallback_user->ID : 0,
+         ];
+     }
+ 
+@@ -1172,6 +1420,34 @@ function app_event_booking(WP_REST_Request $request)
+         return new WP_Error('invalid_event', 'Event not found or not published.', ['status' => 404]);
+     }
+ 
++    $event_visibility = get_post_meta($event_id, 'event_type', true);
++    if ($event_visibility === 'members_only') {
++        $roles = $user->roles;
++        $is_admin = !empty(array_intersect(['administrator', 'editor', 'sub_admin'], $roles));
++        
++        if (!$is_admin) {
++            $meta_event_types_raw = get_user_meta($user->ID, 'event_types', true);
++            $event_types = [];
++            if (is_array($meta_event_types_raw)) {
++                $event_types = array_values(array_filter(array_map('strval', $meta_event_types_raw)));
++            } elseif (is_string($meta_event_types_raw) && $meta_event_types_raw !== '') {
++                $event_types = [$meta_event_types_raw];
++            }
++            $event_types_text = strtolower(implode(' ', $event_types));
++            $meta_events = strtolower((string) get_user_meta($user->ID, 'events', true));
++            $meta_why_join = strtolower((string) get_user_meta($user->ID, 'why_join', true));
++            
++            $is_guest = false;
++            if (strpos($event_types_text, 'open') !== false || strpos($meta_events, 'open') !== false || strpos($meta_why_join, 'guest') !== false) {
++                $is_guest = true;
++            }
++
++            if ($is_guest) {
++                return new WP_Error('members_only_event', 'This event is for members only. Guests cannot book it.', ['status' => 403]);
++            }
++        }
++    }
++
+     /* Event Data */
+     $event_name = get_the_title($event_id);
+     $price = get_post_meta($event_id, 'event_price', true);
+@@ -1219,6 +1495,28 @@ function app_event_booking(WP_REST_Request $request)
+     }
+     $additional_persons = eapi_normalize_additional_persons($additional_persons_raw);
+ 
++    // Profile Fallback Logic for Group Bookings
++    foreach ($additional_persons as &$person) {
++        $p_user_id = intval($person['user_id'] ?? 0);
++        $p_email = $person['email'] ?? '';
++        
++        $fallback_user = null;
++        if ($p_user_id > 0) {
++            $fallback_user = get_user_by('id', $p_user_id);
++        } elseif ($p_email !== '') {
++            $fallback_user = get_user_by('email', $p_email);
++        }
++        
++        if ($fallback_user) {
++            if (empty($person['name'])) $person['name'] = $fallback_user->display_name ?: $fallback_user->user_login;
++            if (empty($person['email'])) $person['email'] = $fallback_user->user_email;
++            if (empty($person['phone'])) $person['phone'] = get_user_meta($fallback_user->ID, 'phone', true);
++            if (empty($person['nic'])) $person['nic'] = get_user_meta($fallback_user->ID, 'cnic', true);
++            if (empty($person['gender'])) $person['gender'] = eapi_sanitize_tier_gender(get_user_meta($fallback_user->ID, 'gender', true));
++        }
++    }
++    unset($person);
++
+     if ($is_group_booking && empty($additional_persons) && $couple) {
+         $additional_persons = [[
+             'name' => $couple['name'] ?? '',
+@@ -1426,7 +1724,7 @@ function app_event_booking(WP_REST_Request $request)
+             'isGuestEntry'      => 0,
+             'pair_code'         => $pair_code,
+         ],
+-        ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%s']
++        ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%s']
+     );
+ 
+     if ($primary_inserted === false || $wpdb->last_error) {
+@@ -1466,7 +1764,7 @@ function app_event_booking(WP_REST_Request $request)
+                 'isGuestEntry'      => 1,
+                 'pair_code'         => $pair_code,
+             ],
+-            ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%s']
++            ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%s']
+         );
+ 
+         if ($guest_inserted === false || $wpdb->last_error) {
+@@ -1515,7 +1813,7 @@ function app_event_booking(WP_REST_Request $request)
+                     'isGuestEntry'      => 1,
+                     'pair_code'         => $pair_code,
+                 ],
+-                ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%s']
++                ['%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s', '%d', '%s']
+             );
+ 
+             if ($group_inserted === false || $wpdb->last_error) {
+@@ -1735,6 +2033,20 @@ add_action('rest_api_init', function () {
+         'permission_callback' => '__return_true',
+         'callback' => 'eapi_rest_get_my_bookings'
+     ]);
++
++    register_rest_route('app/v1', '/auth-debug', [
++        'methods' => 'GET',
++        'permission_callback' => '__return_true',
++        'callback' => function ($request) {
++            return [
++                'headers' => $request->get_headers(),
++                'server_http_auth' => $_SERVER['HTTP_AUTHORIZATION'] ?? null,
++                'server_redirect_http_auth' => $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? null,
++                'app_decode_token_exists' => function_exists('app_decode_token'),
++                'eapi_decode_auth_email_exists' => function_exists('eapi_decode_auth_email'),
++            ];
++        }
++    ]);
+ });
+ 
+ function eapi_rest_get_my_bookings($request)
+@@ -1798,6 +2110,19 @@ function eapi_rest_get_my_bookings($request)
+         return intval($b['id'] ?? 0) <=> intval($a['id'] ?? 0);
+     });
+ 
++    // Build attendees lookup by pair_code for live status display
++    $attendees_by_pair = [];
++    foreach ($results as $r) {
++        $pc = sanitize_text_field((string) ($r['pair_code'] ?? ''));
++        if ($pc === '') continue;
++        $attendees_by_pair[$pc][] = [
++            'name'        => sanitize_text_field($r['username'] ?? ''),
++            'email'       => sanitize_email($r['email'] ?? ''),
++            'user_status' => sanitize_text_field($r['user_status'] ?? 'Waiting Approval'),
++            'is_primary'  => intval($r['isGuestEntry'] ?? 0) === 0,
++        ];
++    }
++
+     $bookings = [];
+     foreach ($results as $row) {
+         $event_id = isset($row['event_id']) ? (int)$row['event_id'] : 0;
+@@ -1856,6 +2181,7 @@ function eapi_rest_get_my_bookings($request)
+             }
+         }
+ 
++        $booking_pair_code = sanitize_text_field((string) ($row['pair_code'] ?? ''));
+         $bookings[] = [
+             'booking_id'        => (int)($row['id'] ?? 0),
+             'event_id'          => $event_id,
+@@ -1875,10 +2201,12 @@ function eapi_rest_get_my_bookings($request)
+             'registered_at'     => $row['booking_date'] ?? '',
+             'important_information' => $important_info,
+             'is_guest_entry'    => intval($row['isGuestEntry'] ?? 0) === 1,
+-            'pair_code'         => sanitize_text_field((string) ($row['pair_code'] ?? '')),
++            'pair_code'         => $booking_pair_code,
+             'is_couple_booking' => intval($row['isCoupleBooking'] ?? 0) === 1,
+-            'is_group_booking'  => intval($row['isCoupleBooking'] ?? 0) !== 1 && sanitize_text_field((string) ($row['pair_code'] ?? '')) !== '',
++            'is_group_booking'  => intval($row['isCoupleBooking'] ?? 0) !== 1 && $booking_pair_code !== '',
+             'invited_by_email'  => sanitize_email($row['invited_by_email'] ?? ''),
++            'invited_by_name'   => sanitize_text_field($row['couple_name'] ?? ''),
++            'attendees'         => $booking_pair_code !== '' ? ($attendees_by_pair[$booking_pair_code] ?? []) : [],
+             'ticket_token'      => (function_exists('app_generate_ticket_token') && !empty($row['qr_id']))
+                                     ? app_generate_ticket_token((int)($row['id'] ?? 0), sanitize_text_field($row['qr_id']))
+                                     : '',
+@@ -2301,12 +2629,27 @@ function eapi_rest_create_booking($request)
+ {
+     // --- get Authorization token same as userProfile ---
+     $auth_header = '';
+-    if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
+-        $auth_header = trim($_SERVER['HTTP_AUTHORIZATION']);
+-    } elseif (function_exists('apache_request_headers')) {
+-        $headers = apache_request_headers();
+-        if (isset($headers['Authorization'])) {
+-            $auth_header = trim($headers['Authorization']);
++    if (function_exists('app_get_auth_token')) {
++        $auth_header = app_get_auth_token($request);
++    } else {
++        $auth_header = $request->get_header('authorization');
++        if (!$auth_header) {
++            $auth_header = trim((string) $request->get_param('token'));
++            if ($auth_header === '' && isset($_SERVER['HTTP_AUTHORIZATION'])) {
++                $auth_header = trim($_SERVER['HTTP_AUTHORIZATION']);
++            }
++            if ($auth_header === '' && isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION'])) {
++                $auth_header = trim($_SERVER['REDIRECT_HTTP_AUTHORIZATION']);
++            }
++            if ($auth_header === '' && function_exists('apache_request_headers')) {
++                $headers = apache_request_headers();
++                foreach ($headers as $key => $value) {
++                    if (strtolower($key) === 'authorization') {
++                        $auth_header = trim($value);
++                        break;
++                    }
++                }
++            }
+         }
+     }
+ 
+@@ -2817,18 +3160,12 @@ function eapi_calculate_rewards($event_count) {
+  * GET user rewards - returns current rewards from WordPress usermeta
+  */
+ function eapi_get_user_rewards($request) {
+-    $auth_header = $request->get_header('authorization');
+-    if (!$auth_header) {
+-        return new WP_Error('no_token', 'Authorization token required.', ['status' => 401]);
+-    }
+-    
+-    // Decode token
+-    $decoded = json_decode(base64_decode($auth_header), true);
+-    if (empty($decoded['email'])) {
+-        return new WP_Error('invalid_token', 'Invalid token.', ['status' => 401]);
++    $user_email = eapi_decode_auth_email($request);
++    if (is_wp_error($user_email)) {
++        return $user_email;
+     }
+     
+-    $user = get_user_by('email', sanitize_email($decoded['email']));
++    $user = get_user_by('email', $user_email);
+     if (!$user) {
+         return new WP_Error('user_not_found', 'User not found.', ['status' => 404]);
+     }
+@@ -2867,17 +3204,12 @@ function eapi_get_user_rewards($request) {
+  * POST update user rewards - recalculates from bookings and updates usermeta
+  */
+ function eapi_update_user_rewards($request) {
+-    $auth_header = $request->get_header('authorization');
+-    if (!$auth_header) {
+-        return new WP_Error('no_token', 'Authorization token required.', ['status' => 401]);
+-    }
+-    
+-    $decoded = json_decode(base64_decode($auth_header), true);
+-    if (empty($decoded['email'])) {
+-        return new WP_Error('invalid_token', 'Invalid token.', ['status' => 401]);
++    $user_email = eapi_decode_auth_email($request);
++    if (is_wp_error($user_email)) {
++        return $user_email;
+     }
+     
+-    $user = get_user_by('email', sanitize_email($decoded['email']));
++    $user = get_user_by('email', $user_email);
+     if (!$user) {
+         return new WP_Error('user_not_found', 'User not found.', ['status' => 404]);
+     }
+@@ -2910,17 +3242,12 @@ function eapi_update_user_rewards($request) {
+  */
+ function eapi_get_members_progress($request) {
+     // Verify admin user
+-    $auth_header = $request->get_header('authorization');
+-    if (!$auth_header) {
+-        return new WP_Error('no_token', 'Authorization token required.', ['status' => 401]);
+-    }
+-    
+-    $decoded_token = json_decode(base64_decode($auth_header), true);
+-    if (empty($decoded_token['email'])) {
+-        return new WP_Error('invalid_token', 'Invalid token.', ['status' => 401]);
++    $admin_email = eapi_decode_auth_email($request);
++    if (is_wp_error($admin_email)) {
++        return $admin_email;
+     }
+     
+-    $admin_user = get_user_by('email', sanitize_email($decoded_token['email']));
++    $admin_user = get_user_by('email', $admin_email);
+     if (!$admin_user || !in_array('administrator', $admin_user->roles)) {
+         return new WP_Error('forbidden', 'Admin access required.', ['status' => 403]);
+     }
+@@ -2963,4 +3290,4 @@ function eapi_get_members_progress($request) {
+         'count' => count($members_progress),
+         'members' => $members_progress
+     ];
+-}
+\ No newline at end of file
++}
